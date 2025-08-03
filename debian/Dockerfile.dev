@@ -1,56 +1,6 @@
 ARG PHP=8.3
 
-# Modified prepare-app stage to build from fork instead of downloading release
-FROM node:20-bookworm AS prepare-app
-
-WORKDIR /build
-
-# Install PHP and required extensions for composer
-RUN apt-get update && apt-get install -y \
-    php-cli \
-    php-bcmath \
-    php-gd \
-    php-mbstring \
-    php-xml \
-    php-curl \
-    php-zip \
-    git \
-    unzip
-
-# Install composer
-RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
-
-# Clone your forked repository
-RUN git clone --depth 1 -b v5-stable https://github.com/jacksongriggs/invoiceninja.git /var/www/html
-
-WORKDIR /var/www/html
-
-# Install composer dependencies
-RUN composer install --no-dev --optimize-autoloader
-
-# Download UI release from your fork (built by GitHub Actions)
-RUN curl -L -o ui.zip https://github.com/jacksongriggs/ui/releases/latest/download/invoiceninja-react.zip && \
-    unzip -q ui.zip && \
-    cp -r dist/* public/ && \
-    mv public/index.html resources/views/react/index.blade.php && \
-    rm -rf ui.zip dist/
-
-# Build main app assets
-RUN npm ci && npm run production
-
-# Clean up
-RUN rm -rf node_modules ui .git
-
-# Create necessary links and prepare public directory
-USER www-data
-RUN ln -s /var/www/html/resources/views/react/index.blade.php /var/www/html/public/index.html && \
-    php artisan storage:link && \
-    # Workaround for application updates (same as original)
-    mv /var/www/html/public /tmp/public
-
-# ==================
-# EVERYTHING BELOW THIS LINE IS IDENTICAL TO THE ORIGINAL DOCKERFILE
-# ==================
+# Development Dockerfile - includes build tools but not the app code
 FROM php:${PHP}-fpm
 
 # PHP modules
@@ -58,11 +8,14 @@ ARG php_require="bcmath gd mbstring pdo_mysql zip"
 ARG php_suggest="exif imagick intl pcntl saxon soap"
 ARG php_extra="opcache"
 
-# Install system dependencies
+# Install system dependencies including Node.js for building
 RUN apt-get update && apt-get install -y --no-install-recommends \
     mariadb-client \
     gpg \
     supervisor \
+    git \
+    curl \
+    unzip \
     # Unicode support for PDF
     fonts-noto-cjk-extra \
     fonts-wqy-microhei \
@@ -89,6 +42,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Node.js for development builds
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
 # Install PHP extensions
 COPY --from=ghcr.io/mlocati/php-extension-installer /usr/bin/install-php-extensions /usr/local/bin/
 
@@ -97,22 +55,25 @@ RUN install-php-extensions \
     ${php_suggest} \
     ${php_extra}
 
+# Install Composer
+COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
+
 # Configure PHP
 RUN ln -s "$PHP_INI_DIR/php.ini-production" "$PHP_INI_DIR/php.ini"
 
 COPY php/php.ini /usr/local/etc/php/conf.d/invoiceninja.ini
-
 COPY php/php-fpm.conf /usr/local/etc/php-fpm.d/invoiceninja.conf
 
 # Setup supervisor
 COPY supervisor/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
-# Setup InvoiceNinja
-COPY --from=prepare-app /var/www/html /var/www/html
-COPY --from=prepare-app /tmp/public /tmp/public
-
 # Add initialization script
 COPY --chmod=0755 scripts/init.sh /usr/local/bin/init.sh
+
+# Create working directory
+RUN mkdir -p /var/www/html && chown -R www-data:www-data /var/www
+
+WORKDIR /var/www/html
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \

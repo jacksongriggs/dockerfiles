@@ -1,0 +1,183 @@
+ARG PHP=8.3
+
+# ==================
+# Stage 1: Download dependencies that rarely change
+# ==================
+FROM node:20-bookworm AS deps
+
+WORKDIR /deps
+
+# Cache package.json files first (change less frequently)
+RUN git clone --depth 1 -b v5-stable https://github.com/jacksongriggs/invoiceninja.git temp && \
+    cp temp/package*.json ./ && \
+    cp temp/composer.json temp/composer.lock* ./ && \
+    rm -rf temp
+
+# ==================
+# Stage 2: Build composer dependencies (changes rarely)
+# ==================
+FROM php:${PHP}-fpm-alpine AS composer-deps
+
+WORKDIR /app
+
+# Install composer
+COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
+
+# Copy only composer files for better caching
+COPY --from=deps /deps/composer.json /deps/composer.lock* ./
+
+# Install composer dependencies (cached unless composer.json changes)
+RUN composer install --no-dev --no-scripts --no-autoloader --prefer-dist
+
+# ==================
+# Stage 3: Build npm dependencies for main app (changes occasionally)
+# ==================
+FROM node:20-alpine AS npm-deps
+
+WORKDIR /app
+
+# Copy only package files for better caching
+COPY --from=deps /deps/package*.json ./
+
+# Install npm dependencies (cached unless package.json changes)
+RUN npm ci
+
+# ==================
+# Stage 4: Build the React UI (changes frequently)
+# ==================
+FROM node:20-bookworm AS react-build
+
+WORKDIR /ui
+
+# Clone UI repository
+RUN git clone https://github.com/invoiceninja/ui.git . && \
+    git checkout develop
+
+# Prepare environment
+RUN sed -i 's/VITE_IS_TEST=true/VITE_IS_TEST=false/' .env.example && \
+    echo "VITE_PUSHER_APP_KEY=f0111a02782708da651f" >> .env.example && \
+    cp .env.example .env
+
+# Install and build (UI changes frequently, so this is separate)
+RUN npm ci && npm run build
+
+# ==================
+# Stage 5: Assemble the application
+# ==================
+FROM node:20-bookworm AS app-build
+
+WORKDIR /var/www/html
+
+# Install PHP for artisan commands
+RUN apt-get update && apt-get install -y \
+    php-cli \
+    php-bcmath \
+    php-gd \
+    php-mbstring \
+    php-xml \
+    php-curl \
+    php-zip \
+    git
+
+# Clone the main repository
+RUN git clone --depth 1 -b v5-stable https://github.com/jacksongriggs/invoiceninja.git .
+
+# Copy pre-built dependencies (cached layers)
+COPY --from=composer-deps /app/vendor ./vendor
+COPY --from=npm-deps /app/node_modules ./node_modules
+
+# Copy React UI build
+COPY --from=react-build /ui/dist/* ./public/
+RUN mv public/index.html resources/views/react/index.blade.php
+
+# Copy vite config for React
+COPY --from=react-build /ui/.env ./ui/.env
+RUN cp vite.config.ts.react vite.config.js
+
+# Build main app assets (only runs if app code changed)
+RUN npm run production
+
+# Final cleanup and preparation
+RUN rm -rf node_modules ui .git
+
+# Generate optimized autoloader
+COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
+RUN composer dump-autoload --optimize --no-dev
+
+# Create necessary links and prepare public directory
+USER www-data
+RUN ln -s /var/www/html/resources/views/react/index.blade.php /var/www/html/public/index.html && \
+    php artisan storage:link && \
+    mv /var/www/html/public /tmp/public
+
+# ==================
+# Final production image (same as original)
+# ==================
+FROM php:${PHP}-fpm
+
+# PHP modules
+ARG php_require="bcmath gd mbstring pdo_mysql zip"
+ARG php_suggest="exif imagick intl pcntl saxon soap"
+ARG php_extra="opcache"
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    mariadb-client \
+    gpg \
+    supervisor \
+    # Unicode support for PDF
+    fonts-noto-cjk-extra \
+    fonts-wqy-microhei \
+    fonts-wqy-zenhei \
+    xfonts-wqy \
+    # Install google-chrome-stable(amd64)/chromium(arm64)
+    && if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+    mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | \
+    gpg --dearmor -o /etc/apt/keyrings/google.gpg \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google.gpg] https://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends google-chrome-stable; \
+    elif [ "$(dpkg --print-architecture)" = "arm64" ]; then \
+    apt-get install -y --no-install-recommends \
+    chromium; \        
+    fi \
+    # Create config directory for chromium/google-chrome-stable
+    && mkdir /var/www/.config \
+    && chown www-data:www-data /var/www/.config \
+    # Cleanup
+    && apt-get purge -y gpg \
+    && apt-get autoremove -y \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install PHP extensions
+COPY --from=ghcr.io/mlocati/php-extension-installer /usr/bin/install-php-extensions /usr/local/bin/
+
+RUN install-php-extensions \
+    ${php_require} \
+    ${php_suggest} \
+    ${php_extra}
+
+# Configure PHP
+RUN ln -s "$PHP_INI_DIR/php.ini-production" "$PHP_INI_DIR/php.ini"
+
+COPY php/php.ini /usr/local/etc/php/conf.d/invoiceninja.ini
+COPY php/php-fpm.conf /usr/local/etc/php-fpm.d/invoiceninja.conf
+
+# Setup supervisor
+COPY supervisor/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+# Setup InvoiceNinja
+COPY --from=app-build /var/www/html /var/www/html
+COPY --from=app-build /tmp/public /tmp/public
+
+# Add initialization script
+COPY --chmod=0755 scripts/init.sh /usr/local/bin/init.sh
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD pgrep -f "php-fpm: master process"
+
+ENTRYPOINT ["/usr/local/bin/init.sh"]
+CMD ["supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
