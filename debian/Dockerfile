@@ -1,18 +1,61 @@
 ARG PHP=8.3
 
-FROM php:${PHP}-fpm AS prepare-app
+# Modified prepare-app stage to build from fork instead of downloading release
+FROM node:20-bookworm AS prepare-app
 
+WORKDIR /build
+
+# Install PHP and required extensions for composer
+RUN apt-get update && apt-get install -y \
+    php-cli \
+    php-bcmath \
+    php-gd \
+    php-mbstring \
+    php-xml \
+    php-curl \
+    php-zip \
+    git \
+    unzip
+
+# Install composer
+RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+
+# Clone your forked repository
+RUN git clone --depth 1 -b v5-stable https://github.com/jacksongriggs/invoiceninja.git /var/www/html
+
+WORKDIR /var/www/html
+
+# Install composer dependencies
+RUN composer install --no-dev --optimize-autoloader
+
+# Clone and build React UI
+RUN git clone https://github.com/invoiceninja/ui.git ui && \
+    cd ui && \
+    git checkout develop && \
+    sed -i 's/VITE_IS_TEST=true/VITE_IS_TEST=false/' .env.example && \
+    echo "VITE_PUSHER_APP_KEY=f0111a02782708da651f" >> .env.example && \
+    cp .env.example .env && \
+    cp ../vite.config.ts.react ./vite.config.js && \
+    npm ci && \
+    npm run build && \
+    cp -r dist/* ../public/ && \
+    mv ../public/index.html ../resources/views/react/index.blade.php
+
+# Build main app assets
+RUN npm ci && npm run production
+
+# Clean up
+RUN rm -rf node_modules ui .git
+
+# Create necessary links and prepare public directory
 USER www-data
-
-RUN curl -sL "https://github.com/invoiceninja/invoiceninja/releases/latest/download/invoiceninja.tar.gz" | \
-    tar -xz -C /var/www/html \
-    && ln -s /var/www/html/resources/views/react/index.blade.php /var/www/html/public/index.html \
-    && php artisan storage:link \
-    # Workaround for application updates
-    && mv /var/www/html/public /tmp/public
+RUN ln -s /var/www/html/resources/views/react/index.blade.php /var/www/html/public/index.html && \
+    php artisan storage:link && \
+    # Workaround for application updates (same as original)
+    mv /var/www/html/public /tmp/public
 
 # ==================
-# InvoiceNinja image
+# EVERYTHING BELOW THIS LINE IS IDENTICAL TO THE ORIGINAL DOCKERFILE
 # ==================
 FROM php:${PHP}-fpm
 
