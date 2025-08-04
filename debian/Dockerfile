@@ -29,7 +29,7 @@ WORKDIR /var/www/html
 RUN composer install --no-dev --optimize-autoloader
 
 # Install MCP SDK separately
-RUN composer require logiscape/mcp-sdk-php --no-dev --no-scripts
+RUN composer require logiscape/mcp-sdk-php --no-scripts --optimize-autoloader
 
 # Download UI release from your fork (built by GitHub Actions)
 RUN curl -L -o ui.zip https://github.com/jacksongriggs/ui/releases/latest/download/invoiceninja-react.zip && \
