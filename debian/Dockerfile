@@ -25,9 +25,11 @@ RUN git clone --depth 1 -b v5-stable https://github.com/jacksongriggs/invoicenin
 
 WORKDIR /var/www/html
 
-# Install composer dependencies including MCP SDK
-RUN composer install --no-dev --optimize-autoloader && \
-    composer require logiscape/mcp-sdk-php --no-dev --optimize-autoloader
+# Install composer dependencies
+RUN composer install --no-dev --optimize-autoloader
+
+# Install MCP SDK separately
+RUN composer require logiscape/mcp-sdk-php --no-dev --no-scripts
 
 # Download UI release from your fork (built by GitHub Actions)
 RUN curl -L -o ui.zip https://github.com/jacksongriggs/ui/releases/latest/download/invoiceninja-react.zip && \
