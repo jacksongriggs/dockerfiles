@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y \
 RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
 
 # Clone your forked repository
-RUN git clone --depth 1 -b v5-stable https://github.com/jacksongriggs/invoiceninja.git /var/www/html
+RUN git clone --depth 1 -b v5-stable https://github.com/jacksongriggs/invoiceninja-backend.git /var/www/html
 
 WORKDIR /var/www/html
 
