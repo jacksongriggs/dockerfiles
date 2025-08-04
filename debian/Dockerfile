@@ -42,7 +42,6 @@ RUN npm ci && npm run production
 RUN rm -rf node_modules ui .git
 
 # Create necessary links and prepare public directory
-USER www-data
 RUN ln -s /var/www/html/resources/views/react/index.blade.php /var/www/html/public/index.html && \
     php artisan storage:link && \
     # Workaround for application updates (same as original)
@@ -110,6 +109,11 @@ COPY supervisor/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 # Setup InvoiceNinja
 COPY --from=prepare-app /var/www/html /var/www/html
 COPY --from=prepare-app /tmp/public /tmp/public
+
+# Fix ownership for www-data
+RUN chown -R www-data:www-data /var/www/html && \
+    chmod -R 755 /var/www/html/bootstrap/cache && \
+    chmod -R 755 /var/www/html/storage
 
 # Add initialization script
 COPY --chmod=0755 scripts/init.sh /usr/local/bin/init.sh
