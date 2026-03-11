@@ -1,57 +1,42 @@
 ARG PHP=8.3
 
-# Modified prepare-app stage to build from fork instead of downloading release
-FROM node:20-bookworm AS prepare-app
+# Build app from our fork instead of downloading upstream release
+FROM php:${PHP}-fpm AS prepare-app
 
-WORKDIR /build
-
-# Install PHP and required extensions for composer
-RUN apt-get update && apt-get install -y \
-    php-cli \
-    php-bcmath \
-    php-gd \
-    php-mbstring \
-    php-xml \
-    php-curl \
-    php-zip \
+# Install git, unzip, and composer
+RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
-    unzip
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install composer
 RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
 
-# Clone your forked repository
+# Clone our forked backend
 RUN git clone --depth 1 -b v5-stable https://github.com/jacksongriggs/invoiceninja-backend.git /var/www/html
 
 WORKDIR /var/www/html
 
-# Configure composer to avoid GitHub rate limits (use HTTPS to avoid auth issues)
-RUN composer config --global github-protocols https
+# Install PHP extensions needed for composer install
+COPY --from=ghcr.io/mlocati/php-extension-installer /usr/bin/install-php-extensions /usr/local/bin/
+RUN install-php-extensions bcmath gd mbstring pdo_mysql zip
 
-# Install composer dependencies (includes MCP SDK from composer.json)
-RUN composer install --no-dev --optimize-autoloader --prefer-dist
+# Install composer dependencies (includes MCP SDK)
+RUN composer config --global github-protocols https \
+    && composer install --no-dev --optimize-autoloader --prefer-dist
 
-# Download UI release from your fork (built by GitHub Actions)
-RUN curl -L -o ui.zip https://github.com/jacksongriggs/ui/releases/latest/download/invoiceninja-react.zip && \
-    unzip -q ui.zip && \
-    cp -r dist/* public/ && \
-    mv public/index.html resources/views/react/index.blade.php && \
-    rm -rf ui.zip dist/
+# Download UI release from our fork
+RUN curl -L -o ui.zip https://github.com/jacksongriggs/invoiceninja-ui/releases/latest/download/invoiceninja-react.zip \
+    && unzip -q ui.zip \
+    && cp -r dist/* public/ \
+    && mv public/index.html resources/views/react/index.blade.php \
+    && rm -rf ui.zip dist/
 
-# Build main app assets
-RUN npm ci && npm run production
-
-# Clean up
-RUN rm -rf node_modules ui .git
-
-# Create necessary links and prepare public directory
-RUN ln -s /var/www/html/resources/views/react/index.blade.php /var/www/html/public/index.html && \
-    php artisan storage:link && \
-    # Workaround for application updates (same as original)
-    mv /var/www/html/public /tmp/public
+RUN ln -s /var/www/html/resources/views/react/index.blade.php /var/www/html/public/index.html \
+    && php artisan storage:link \
+    && mv /var/www/html/public /tmp/public
 
 # ==================
-# EVERYTHING BELOW THIS LINE IS IDENTICAL TO THE ORIGINAL DOCKERFILE
+# EVERYTHING BELOW IS IDENTICAL TO UPSTREAM
 # ==================
 FROM php:${PHP}-fpm
 
@@ -62,8 +47,10 @@ ARG php_extra="opcache"
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    libfcgi-bin \
     mariadb-client \
     gpg \
+    rsync \
     supervisor \
     # Unicode support for PDF
     fonts-noto-cjk-extra \
@@ -80,7 +67,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends google-chrome-stable; \
     elif [ "$(dpkg --print-architecture)" = "arm64" ]; then \
     apt-get install -y --no-install-recommends \
-    chromium; \        
+    chromium; \
     fi \
     # Create config directory for chromium/google-chrome-stable
     && mkdir /var/www/.config \
@@ -106,24 +93,22 @@ COPY php/php.ini /usr/local/etc/php/conf.d/invoiceninja.ini
 
 COPY php/php-fpm.conf /usr/local/etc/php-fpm.d/invoiceninja.conf
 
+# Workaround: Disable SSL for mariadb-client for compatibility with MySQL
+RUN echo "skip-ssl = true" >> /etc/mysql/mariadb.conf.d/50-client.cnf
+
 # Setup supervisor
 COPY supervisor/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
 # Setup InvoiceNinja
-COPY --from=prepare-app /var/www/html /var/www/html
-COPY --from=prepare-app /tmp/public /tmp/public
-
-# Fix ownership for www-data
-RUN chown -R www-data:www-data /var/www/html && \
-    chmod -R 755 /var/www/html/bootstrap/cache && \
-    chmod -R 755 /var/www/html/storage
+COPY --from=prepare-app --chown=www-data:www-data /var/www/html /var/www/html
+COPY --from=prepare-app --chown=www-data:www-data /tmp/public /tmp/public
 
 # Add initialization script
 COPY --chmod=0755 scripts/init.sh /usr/local/bin/init.sh
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD pgrep -f "php-fpm: master process"
+HEALTHCHECK --start-period=100s \
+    CMD REMOTE_ADDR=127.0.0.1 REQUEST_URI=/health REQUEST_METHOD=GET SCRIPT_FILENAME=/var/www/html/public/index.php cgi-fcgi -bind -connect 127.0.0.1:9000 | grep '{"status":"ok","message":"API is healthy"}'
 
 ENTRYPOINT ["/usr/local/bin/init.sh"]
 CMD ["supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
